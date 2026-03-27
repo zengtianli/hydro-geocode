@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+.streamlit/secrets.toml
+venv/
+.venv/
+data/output/
+data/archived/
+data/input/
+*.tmp
+*_temp.csv
