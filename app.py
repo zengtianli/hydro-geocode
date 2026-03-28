@@ -31,13 +31,15 @@ DATA_SAMPLE_DIR = PROJECT_DIR / 'data' / 'sample'
 DATA_OUTPUT_DIR = PROJECT_DIR / 'data' / 'output'
 
 sys.path.insert(0, str(SRC_DIR))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from reverse_geocode import reverse_geocode, wgs84_to_gcj02
+from src.common.st_utils import page_config, footer
 
 # ============================================================
 # 页面配置
 # ============================================================
-st.set_page_config(page_title="地理编码工具", page_icon="📍", layout="wide")
+page_config("地理编码 - Hydro Toolkit", "📍")
 
 # ============================================================
 # 检查 API Key
@@ -308,10 +310,4 @@ else:
 # ============================================================
 # 页脚
 # ============================================================
-st.markdown("---")
-st.markdown(
-    "<div style='text-align: center; color: gray;'>"
-    "📍 地理编码工具 | 基于高德地图 API"
-    "</div>",
-    unsafe_allow_html=True
-)
+footer("地理编码", repo_url="https://github.com/zengtianli/hydro-geocode")
