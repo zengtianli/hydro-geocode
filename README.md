@@ -18,7 +18,7 @@
 
 ---
 
-![hydro-geocode demo](docs/screenshots/demo.svg)
+![hydro-geocode demo](docs/screenshots/demo.png)
 
         ---
 
