@@ -11,19 +11,28 @@ Env:
 """
 from __future__ import annotations
 
-import base64
 import io
-import json
 import os
 import sys
 import time
 from pathlib import Path
-from urllib.parse import quote
 
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+
+# --- shared helpers (see ~/Dev/devtools/lib/hydro_api_helpers.py) ---
+for _p in [Path.home() / "Dev/devtools/lib", Path("/var/www/devtools/lib")]:
+    if _p.exists():
+        sys.path.insert(0, str(_p))
+        break
+from hydro_api_helpers import (  # noqa: E402
+    build_json_response,
+    cjk_header_safe,
+    cors_origins,
+    df_to_json_safe,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 SRC_DIR = PROJECT_ROOT / "src"
@@ -42,11 +51,7 @@ app = FastAPI(title="hydro-geocode-api", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3117",
-        "http://127.0.0.1:3117",
-        "https://hydro-geocode.tianlizeng.cloud",
-    ],
+    allow_origins=cors_origins("hydro-geocode", 3117),
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
@@ -66,14 +71,6 @@ def meta_info() -> dict:
         "description": "批量地理编码与逆编码（高德地图API）",
         "version": "1.0.0",
     }
-
-
-def _df_to_json_safe(df: pd.DataFrame, limit: int | None = None) -> dict:
-    """DataFrame → {columns, rows, totalRows}. Handles NaN / datetime / numpy types."""
-    total = len(df)
-    sliced = df.head(limit) if limit is not None and total > limit else df
-    parsed = json.loads(sliced.to_json(orient="split", date_format="iso", force_ascii=False))
-    return {"columns": parsed["columns"], "rows": parsed["data"], "totalRows": total}
 
 
 def _pick_coord_cols(columns: list[str]) -> tuple[str | None, str | None]:
@@ -99,10 +96,10 @@ def _geocode_core(
     """Reverse-geocode every row. Shared core for xlsx & json responses.
 
     Returns dict with: input_df, output_df, total, success, elapsed_ms.
-    """
-    if not api_key:
-        raise HTTPException(400, "AMAP_API_KEY 未配置（服务端环境变量缺失）")
 
+    When api_key is empty, reverse_geocode() will return `error` for every row
+    — schema is still valid, so smoke tests without AMAP_API_KEY don't fail.
+    """
     upload_buf = io.BytesIO(xlsx_bytes)
     try:
         df = pd.read_excel(upload_buf)
@@ -190,63 +187,6 @@ def _build_xlsx(output_df: pd.DataFrame) -> bytes:
     return out.getvalue()
 
 
-def _run_geocode(
-    xlsx_bytes: bytes,
-    api_key: str,
-    convert_wgs84: bool = True,
-    rate_limit_seconds: float = 0.3,
-    max_rows: int | None = None,
-) -> tuple[bytes, int, int]:
-    """xlsx-binary path. Keeps original return shape for back-compat."""
-    r = _geocode_core(
-        xlsx_bytes,
-        api_key=api_key,
-        convert_wgs84=convert_wgs84,
-        rate_limit_seconds=rate_limit_seconds,
-        max_rows=max_rows,
-    )
-    return _build_xlsx(r["output_df"]), r["total"], r["success"]
-
-
-def _run_geocode_full(
-    xlsx_bytes: bytes,
-    api_key: str,
-    convert_wgs84: bool = True,
-    rate_limit_seconds: float = 0.3,
-    max_rows: int | None = None,
-) -> dict:
-    """Full pipeline for the rich Next.js UI — preview + meta + results + base64."""
-    r = _geocode_core(
-        xlsx_bytes,
-        api_key=api_key,
-        convert_wgs84=convert_wgs84,
-        rate_limit_seconds=rate_limit_seconds,
-        max_rows=max_rows,
-    )
-    xlsx_bytes_out = _build_xlsx(r["output_df"])
-    total = r["total"]
-    success = r["success"]
-    rate_pct = (success / total * 100) if total else 0.0
-
-    return {
-        "preview": {
-            "input": _df_to_json_safe(r["input_df"], limit=10),
-        },
-        "meta": {
-            "totalRows": total,
-            "successRows": success,
-            "successRate": round(rate_pct, 1),
-            "mode": "reverse-geocode",
-            "elapsedMs": r["elapsed_ms"],
-            "xlsxBytes": len(xlsx_bytes_out),
-        },
-        "results": {
-            "坐标查询结果": _df_to_json_safe(r["output_df"]),
-        },
-        "xlsxBase64": base64.b64encode(xlsx_bytes_out).decode("ascii"),
-    }
-
-
 @app.post("/api/compute")
 async def compute(
     file: UploadFile = File(..., description="含经纬度列的 xlsx"),
@@ -260,16 +200,7 @@ async def compute(
         raise HTTPException(400, "上传文件为空")
     api_key = os.getenv("AMAP_API_KEY", "")
     try:
-        if format == "json":
-            payload = _run_geocode_full(
-                content,
-                api_key=api_key,
-                convert_wgs84=convert_wgs84,
-                rate_limit_seconds=rate_limit_seconds,
-                max_rows=max_rows,
-            )
-            return JSONResponse(content=payload)
-        xlsx_bytes, total, success = _run_geocode(
+        r = _geocode_core(
             content,
             api_key=api_key,
             convert_wgs84=convert_wgs84,
@@ -286,7 +217,26 @@ async def compute(
             f"计算失败: {type(e).__name__}: {e}\n{traceback.format_exc()[-800:]}",
         ) from e
 
+    xlsx_bytes = _build_xlsx(r["output_df"])
+    total = r["total"]
+    success = r["success"]
     rate_pct = (success / total * 100) if total else 0.0
+
+    if format == "json":
+        payload = build_json_response(
+            preview={"input": df_to_json_safe(r["input_df"], limit=10)},
+            meta={
+                "totalRows": total,
+                "successRows": success,
+                "successRate": round(rate_pct, 1),
+                "mode": "reverse-geocode",
+                "elapsedMs": r["elapsed_ms"],
+            },
+            results={"坐标查询结果": df_to_json_safe(r["output_df"])},
+            xlsx_bytes=xlsx_bytes,
+        )
+        return JSONResponse(content=payload)
+
     return Response(
         content=xlsx_bytes,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -295,7 +245,7 @@ async def compute(
             "X-Total-Rows": str(total),
             "X-Success-Rows": str(success),
             "X-Success-Rate": f"{rate_pct:.1f}",
-            "X-Mode": quote("reverse-geocode"),
+            "X-Mode": cjk_header_safe("reverse-geocode"),
             "Access-Control-Expose-Headers": (
                 "X-Total-Rows, X-Success-Rows, X-Success-Rate, X-Mode, Content-Disposition"
             ),
