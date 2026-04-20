@@ -11,7 +11,9 @@ Env:
 """
 from __future__ import annotations
 
+import base64
 import io
+import json
 import os
 import sys
 import time
@@ -21,7 +23,7 @@ from urllib.parse import quote
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 SRC_DIR = PROJECT_ROOT / "src"
@@ -66,6 +68,14 @@ def meta_info() -> dict:
     }
 
 
+def _df_to_json_safe(df: pd.DataFrame, limit: int | None = None) -> dict:
+    """DataFrame → {columns, rows, totalRows}. Handles NaN / datetime / numpy types."""
+    total = len(df)
+    sliced = df.head(limit) if limit is not None and total > limit else df
+    parsed = json.loads(sliced.to_json(orient="split", date_format="iso", force_ascii=False))
+    return {"columns": parsed["columns"], "rows": parsed["data"], "totalRows": total}
+
+
 def _pick_coord_cols(columns: list[str]) -> tuple[str | None, str | None]:
     """Match the Streamlit app's column detection heuristic."""
     lng_col: str | None = None
@@ -79,20 +89,16 @@ def _pick_coord_cols(columns: list[str]) -> tuple[str | None, str | None]:
     return lng_col, lat_col
 
 
-def _run_geocode(
+def _geocode_core(
     xlsx_bytes: bytes,
     api_key: str,
     convert_wgs84: bool = True,
     rate_limit_seconds: float = 0.3,
     max_rows: int | None = None,
-) -> tuple[bytes, int, int]:
-    """Reverse-geocode every row of the uploaded xlsx.
+) -> dict:
+    """Reverse-geocode every row. Shared core for xlsx & json responses.
 
-    Input: raw bytes of an xlsx with 经度/纬度 (or lng/lat / JD/WD) columns.
-    Output: (result_xlsx_bytes, total_rows, success_count).
-
-    Adds the columns the Streamlit app does: 地址/省/市/区县/GCJ02_经度/GCJ02_纬度/错误.
-    Honours AMAP free-tier QPS via `rate_limit_seconds` (default 0.3s/row).
+    Returns dict with: input_df, output_df, total, success, elapsed_ms.
     """
     if not api_key:
         raise HTTPException(400, "AMAP_API_KEY 未配置（服务端环境变量缺失）")
@@ -113,9 +119,11 @@ def _run_geocode(
             "未识别到经纬度列（需包含 经度/JD/lng 和 纬度/WD/lat）",
         )
 
+    input_df = df.copy()
     if max_rows is not None:
         df = df.head(max_rows).copy()
 
+    started = time.perf_counter()
     results: list[dict] = []
     success = 0
     total = len(df)
@@ -164,11 +172,79 @@ def _run_geocode(
 
     result_df = pd.DataFrame(results)
     output_df = pd.concat([df.reset_index(drop=True), result_df], axis=1)
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
 
+    return {
+        "input_df": input_df,
+        "output_df": output_df,
+        "total": total,
+        "success": success,
+        "elapsed_ms": elapsed_ms,
+    }
+
+
+def _build_xlsx(output_df: pd.DataFrame) -> bytes:
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        output_df.to_excel(writer, index=False, sheet_name="逆地理编码结果")
-    return out.getvalue(), total, success
+        output_df.to_excel(writer, index=False, sheet_name="坐标查询结果")
+    return out.getvalue()
+
+
+def _run_geocode(
+    xlsx_bytes: bytes,
+    api_key: str,
+    convert_wgs84: bool = True,
+    rate_limit_seconds: float = 0.3,
+    max_rows: int | None = None,
+) -> tuple[bytes, int, int]:
+    """xlsx-binary path. Keeps original return shape for back-compat."""
+    r = _geocode_core(
+        xlsx_bytes,
+        api_key=api_key,
+        convert_wgs84=convert_wgs84,
+        rate_limit_seconds=rate_limit_seconds,
+        max_rows=max_rows,
+    )
+    return _build_xlsx(r["output_df"]), r["total"], r["success"]
+
+
+def _run_geocode_full(
+    xlsx_bytes: bytes,
+    api_key: str,
+    convert_wgs84: bool = True,
+    rate_limit_seconds: float = 0.3,
+    max_rows: int | None = None,
+) -> dict:
+    """Full pipeline for the rich Next.js UI — preview + meta + results + base64."""
+    r = _geocode_core(
+        xlsx_bytes,
+        api_key=api_key,
+        convert_wgs84=convert_wgs84,
+        rate_limit_seconds=rate_limit_seconds,
+        max_rows=max_rows,
+    )
+    xlsx_bytes_out = _build_xlsx(r["output_df"])
+    total = r["total"]
+    success = r["success"]
+    rate_pct = (success / total * 100) if total else 0.0
+
+    return {
+        "preview": {
+            "input": _df_to_json_safe(r["input_df"], limit=10),
+        },
+        "meta": {
+            "totalRows": total,
+            "successRows": success,
+            "successRate": round(rate_pct, 1),
+            "mode": "reverse-geocode",
+            "elapsedMs": r["elapsed_ms"],
+            "xlsxBytes": len(xlsx_bytes_out),
+        },
+        "results": {
+            "坐标查询结果": _df_to_json_safe(r["output_df"]),
+        },
+        "xlsxBase64": base64.b64encode(xlsx_bytes_out).decode("ascii"),
+    }
 
 
 @app.post("/api/compute")
@@ -177,12 +253,22 @@ async def compute(
     convert_wgs84: bool = Form(True, description="输入是否为 WGS-84（需转 GCJ-02）"),
     rate_limit_seconds: float = Form(0.3, description="AMAP 免费版 QPS 节流"),
     max_rows: int | None = Form(None, description="可选：只处理前 N 行"),
+    format: str = Form("xlsx", description="xlsx (binary) | json (preview+results+base64)"),
 ) -> Response:
     content = await file.read()
     if not content:
         raise HTTPException(400, "上传文件为空")
     api_key = os.getenv("AMAP_API_KEY", "")
     try:
+        if format == "json":
+            payload = _run_geocode_full(
+                content,
+                api_key=api_key,
+                convert_wgs84=convert_wgs84,
+                rate_limit_seconds=rate_limit_seconds,
+                max_rows=max_rows,
+            )
+            return JSONResponse(content=payload)
         xlsx_bytes, total, success = _run_geocode(
             content,
             api_key=api_key,
